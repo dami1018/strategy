@@ -1,0 +1,805 @@
+
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math, copy, time
+# 已经被弃用了，使用torch.tensor或者nn.Parameter
+from torch.autograd import Variable
+import matplotlib.pyplot as plt
+import seaborn
+# 1、一般的transformers自带embedding
+# -------------------------------------------------------------------------------
+class EncoderDecoder(nn.Module):
+    """
+    A standard Encoder-Decoder architecture. Base for this and many 
+    other models.
+    """
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+        super(EncoderDecoder, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.tgt_embed = tgt_embed
+        self.generator = generator
+        
+    def forward(self, src, tgt, src_mask, tgt_mask):
+        "Take in and process masked src and target sequences."
+        return self.decode(self.encode(src, src_mask), src_mask,
+                            tgt, tgt_mask)
+    
+    def encode(self, src, src_mask):
+        return self.encoder(self.src_embed(src), src_mask)
+    
+    def decode(self, memory, src_mask, tgt, tgt_mask):
+        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
+class Generator(nn.Module):
+    "Define standard linear + softmax generation step."
+    def __init__(self, d_model, vocab):
+        super(Generator, self).__init__()
+        self.proj = nn.Linear(d_model, vocab)
+
+    def forward(self, x):
+        return F.log_softmax(self.proj(x), dim=-1)
+def clones(module, N):
+    "Produce N identical layers."
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+class Encoder(nn.Module):
+    "Core encoder is a stack of N layers"
+    def __init__(self, layer, N):
+        super(Encoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+        
+    def forward(self, x, mask):
+        "Pass the input (and mask) through each layer in turn."
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
+    
+class LayerNorm(nn.Module):
+    "Construct a layernorm module (See citation for details)."
+    def __init__(self, features, eps=1e-6):
+        super(LayerNorm, self).__init__()
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+class SublayerConnection(nn.Module):
+    """
+    A residual connection followed by a layer norm.
+    Note for code simplicity the norm is first as opposed to last.
+    """
+    def __init__(self, size, dropout):
+        super(SublayerConnection, self).__init__()
+        self.norm = LayerNorm(size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, sublayer):
+        "Apply residual connection to any sublayer with the same size."
+        return x + self.dropout(sublayer(self.norm(x)))
+class EncoderLayer(nn.Module):
+    "Encoder is made up of self-attn and feed forward (defined below)"
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        super(EncoderLayer, self).__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.size = size
+
+    def forward(self, x, mask):
+        "Follow Figure 1 (left) for connections."
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        return self.sublayer[1](x, self.feed_forward)
+
+class Decoder(nn.Module):
+    "Generic N layer decoder with masking."
+    def __init__(self, layer, N):
+        super(Decoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+        
+    def forward(self, x, memory, src_mask, tgt_mask):
+        for layer in self.layers:
+            x = layer(x, memory, src_mask, tgt_mask)
+        return self.norm(x)
+
+class DecoderLayer(nn.Module):
+    "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
+    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
+        super(DecoderLayer, self).__init__()
+        self.size = size
+        self.self_attn = self_attn
+        self.src_attn = src_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+ 
+    def forward(self, x, memory, src_mask, tgt_mask):
+        "Follow Figure 1 (right) for connections."
+        m = memory
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        return self.sublayer[2](x, self.feed_forward)
+    
+def subsequent_mask(size):
+    "Mask out subsequent positions."
+    attn_shape = (1, size, size)
+    subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
+    return torch.from_numpy(subsequent_mask) == 0
+'''
+query = src
+key = src
+value = src
+mask = src_mask
+mask = tgt_mask
+'''
+def attention(query, key, value, mask=None, dropout=None):
+    "Compute 'Scaled Dot Product Attention'"
+    d_k = query.size(-1)
+    scores = torch.matmul(query, key.transpose(-2, -1)) \
+             / math.sqrt(d_k)
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, -1e9)
+    p_attn = F.softmax(scores, dim = -1)
+    if dropout is not None:
+        p_attn = dropout(p_attn)
+        
+    return torch.matmul(p_attn, value), p_attn
+
+class MultiHeadedAttention(nn.Module):
+    def __init__(self, h, d_model, dropout=0.1):
+        "Take in model size and number of heads."
+        super(MultiHeadedAttention, self).__init__()
+        assert d_model % h == 0
+        # We assume d_v always equals d_k
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
+        
+    def forward(self, query, key, value, mask=None):
+        "Implements Figure 2"
+        if mask is not None:
+            # Same mask applied to all h heads.
+            mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
+        
+        # 1) Do all the linear projections in batch from d_model => h x d_k 
+        query, key, value = \
+            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+             for l, x in zip(self.linears, (query, key, value))]
+        
+        # 2) Apply attention on all the projected vectors in batch. 
+        x, self.attn = attention(query, key, value, mask=mask, 
+                                 dropout=self.dropout)
+        
+        # 3) "Concat" using a view and apply a final linear. 
+        x = x.transpose(1, 2).contiguous() \
+             .view(nbatches, -1, self.h * self.d_k)
+        return self.linears[-1](x)
+
+class PositionwiseFeedForward(nn.Module):
+    "Implements FFN equation."
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.w_2(self.dropout(F.relu(self.w_1(x))))
+
+class Embeddings(nn.Module):
+    def __init__(self, d_model, vocab):
+        super(Embeddings, self).__init__()
+        self.lut = nn.Embedding(vocab, d_model)
+        self.d_model = d_model
+
+    def forward(self, x):
+        return self.lut(x) * math.sqrt(self.d_model)
+
+class PositionalEncoding(nn.Module):
+    "Implement the PE function."
+    def __init__(self, d_model, dropout, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        # Compute the positional encodings once in log space.
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) *
+                             -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+        
+    def forward(self, x):
+        x = x + Variable(self.pe[:, :x.size(1)], 
+                         requires_grad=False)
+        return self.dropout(x)
+def make_model(src_vocab, tgt_vocab, N=6, 
+               d_model=512, d_ff=2048, h=8, dropout=0.1):
+    "Helper: Construct a model from hyperparameters."
+    c = copy.deepcopy
+    attn = MultiHeadedAttention(h, d_model)
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    position = PositionalEncoding(d_model, dropout)
+    model = EncoderDecoder(
+        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
+        Decoder(DecoderLayer(d_model, c(attn), c(attn), 
+                             c(ff), dropout), N),
+        nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
+        nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
+        Generator(d_model, tgt_vocab))
+    
+    # This was important from their code. 
+    # Initialize parameters with Glorot / fan_avg.
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform(p)
+    return model
+
+
+src_vocab = 100
+tgt_vocab = 100
+d_model = 512
+m = make_model(src_vocab, tgt_vocab)
+src = torch.randint(1,100,size=(10,10))
+tgt = torch.randint(1,100,size=(10,10))
+src_mask = torch.ones(10,10)
+tgt_mask = torch.tril(src_mask)
+src_mask = src_mask.unsqueeze(0)
+tgt_mask = tgt_mask.unsqueeze(0)
+res = m(src,tgt,src_mask,tgt_mask)
+src_mask.shape
+res.shape
+
+# 2、不带embedding的
+class EncoderDecoder(nn.Module):
+    """
+    A standard Encoder-Decoder architecture. Base for this and many 
+    other models.
+    """
+    # def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+    def __init__(self, encoder, decoder, generator):
+        super(EncoderDecoder, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        # self.src_embed = src_embed
+        # self.tgt_embed = tgt_embed
+        self.generator = generator
+        
+    def forward(self, src, tgt, src_mask, tgt_mask):
+        "Take in and process masked src and target sequences."
+        return self.decode(self.encode(src, src_mask), src_mask,
+                            tgt, tgt_mask)
+    
+    def encode(self, src, src_mask):
+        # return self.encoder(self.src_embed(src), src_mask)
+        return self.encoder(src, src_mask)
+    def decode(self, memory, src_mask, tgt, tgt_mask):
+        # return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
+        return self.decoder(tgt, memory, src_mask, tgt_mask)
+class Generator(nn.Module):
+    "Define standard linear + softmax generation step."
+    def __init__(self, d_model, vocab):
+        super(Generator, self).__init__()
+        self.proj = nn.Linear(d_model, vocab)
+
+    def forward(self, x):
+        return F.log_softmax(self.proj(x), dim=-1)
+def clones(module, N):
+    "Produce N identical layers."
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+class Encoder(nn.Module):
+    "Core encoder is a stack of N layers"
+    def __init__(self, layer, N):
+        super(Encoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+        
+    def forward(self, x, mask):
+        "Pass the input (and mask) through each layer in turn."
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
+    
+class LayerNorm(nn.Module):
+    "Construct a layernorm module (See citation for details)."
+    def __init__(self, features, eps=1e-6):
+        super(LayerNorm, self).__init__()
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+class SublayerConnection(nn.Module):
+    """
+    A residual connection followed by a layer norm.
+    Note for code simplicity the norm is first as opposed to last.
+    """
+    def __init__(self, size, dropout):
+        super(SublayerConnection, self).__init__()
+        self.norm = LayerNorm(size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, sublayer):
+        "Apply residual connection to any sublayer with the same size."
+        return x + self.dropout(sublayer(self.norm(x)))
+class EncoderLayer(nn.Module):
+    "Encoder is made up of self-attn and feed forward (defined below)"
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        super(EncoderLayer, self).__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.size = size
+
+    def forward(self, x, mask):
+        "Follow Figure 1 (left) for connections."
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        return self.sublayer[1](x, self.feed_forward)
+
+class Decoder(nn.Module):
+    "Generic N layer decoder with masking."
+    def __init__(self, layer, N):
+        super(Decoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+        
+    def forward(self, x, memory, src_mask, tgt_mask):
+        for layer in self.layers:
+            x = layer(x, memory, src_mask, tgt_mask)
+        return self.norm(x)
+
+class DecoderLayer(nn.Module):
+    "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
+    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
+        super(DecoderLayer, self).__init__()
+        self.size = size
+        self.self_attn = self_attn
+        self.src_attn = src_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+ 
+    def forward(self, x, memory, src_mask, tgt_mask):
+        "Follow Figure 1 (right) for connections."
+        m = memory
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        return self.sublayer[2](x, self.feed_forward)
+    
+def subsequent_mask(size):
+    "Mask out subsequent positions."
+    attn_shape = (1, size, size)
+    subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
+    return torch.from_numpy(subsequent_mask) == 0
+
+def attention(query, key, value, mask=None, dropout=None):
+    "Compute 'Scaled Dot Product Attention'"
+    d_k = query.size(-1)
+    scores = torch.matmul(query, key.transpose(-2, -1)) \
+             / math.sqrt(d_k)
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, -1e9)
+    p_attn = F.softmax(scores, dim = -1)
+    # print(scores.shape,value.shape)
+    if dropout is not None:
+        p_attn = dropout(p_attn)
+    return torch.matmul(p_attn, value), p_attn
+
+class MultiHeadedAttention(nn.Module):
+    def __init__(self, h, d_model, dropout=0.1):
+        "Take in model size and number of heads."
+        super(MultiHeadedAttention, self).__init__()
+        assert d_model % h == 0
+        # We assume d_v always equals d_k
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
+        
+    def forward(self, query, key, value, mask=None):
+        "Implements Figure 2"
+        if mask is not None:
+            # Same mask applied to all h heads.
+            mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
+        
+        # 1) Do all the linear projections in batch from d_model => h x d_k 
+        query, key, value = \
+            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+             for l, x in zip(self.linears, (query, key, value))]
+        
+        # 2) Apply attention on all the projected vectors in batch. 
+        x, self.attn = attention(query, key, value, mask=mask, 
+                                 dropout=self.dropout)
+        
+        # 3) "Concat" using a view and apply a final linear. 
+        x = x.transpose(1, 2).contiguous() \
+             .view(nbatches, -1, self.h * self.d_k)
+        return self.linears[-1](x)
+
+class PositionwiseFeedForward(nn.Module):
+    "Implements FFN equation."
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.w_2(self.dropout(F.relu(self.w_1(x))))
+
+class Embeddings(nn.Module):
+    def __init__(self, d_model, vocab):
+        super(Embeddings, self).__init__()
+        self.lut = nn.Embedding(vocab, d_model)
+        self.d_model = d_model
+
+    def forward(self, x):
+        return self.lut(x) * math.sqrt(self.d_model)
+
+class PositionalEncoding(nn.Module):
+    "Implement the PE function."
+    def __init__(self, d_model, dropout, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        # Compute the positional encodings once in log space.
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) *
+                             -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+        
+    def forward(self, x):
+        x = x + Variable(self.pe[:, :x.size(1)], 
+                         requires_grad=False)
+        return self.dropout(x)
+'''
+def make_model(src_vocab, tgt_vocab, N=6, 
+               d_model=512, d_ff=2048, h=8, dropout=0.1):
+'''
+def make_model(tgt_vocab,N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
+    "Helper: Construct a model from hyperparameters."
+    c = copy.deepcopy
+    attn = MultiHeadedAttention(h, d_model)
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    # position = PositionalEncoding(d_model, dropout)
+    model = EncoderDecoder(
+        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
+        Decoder(DecoderLayer(d_model, c(attn), c(attn), 
+                             c(ff), dropout), N),
+        # nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
+        # nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
+        Generator(d_model, tgt_vocab))
+    
+    # This was important from their code. 
+    # Initialize parameters with Glorot / fan_avg.
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform(p)
+    return model
+
+
+
+
+
+m = make_model(tgt_vocab,d_model=512,N=2)
+# 模型检查
+m.parameters()
+parameter_list = []
+for name, param in m.named_parameters():
+    parameter_list.append((name,param.shape.value))
+    print(f"参数名称: {name}, 参数形状: {param.shape}, 参数数据: {param.data}")
+total_params = sum(param.numel() for param in m.parameters())
+print(f"模型的参数总数: {total_params}")
+
+
+src = torch.randn(1,10,512)
+tgt = torch.randn(1,10,512)
+src_mask = torch.ones(10,10)
+tgt_mask = torch.tril(src_mask)
+src_mask = src_mask.unsqueeze(0)
+tgt_mask = tgt_mask.unsqueeze(0)
+res = m(src,tgt,src_mask,tgt_mask)
+src_mask.shape
+res.shape
+for parameter in m.parameters():
+    print(parameter)
+sum(torch.numel(parameter) for parameter in m.parameters())
+
+import pandas as pd
+import akshare as ak
+
+stocks = pd.read_csv(r'/Users/qinpeng/Desktop/python项目/天软/stock.csv')
+stock_embed = np.load(r'/Users/qinpeng/Desktop/python项目/天软/embedding.npy')
+stocks.columns
+stocks.drop(columns='Unnamed: 0',inplace=True)
+
+def s_idx(stock,stocks):
+    return stocks[stocks['code']==stock].index.to_list()[0]
+
+begt = "20240101"
+endt = "20241201"
+thres = 5116
+stock_info_a_code_name_df = ak.stock_info_a_code_name()
+# thres = len(stock_info_a_code_name_df)
+# df_rate = pd.DataFrame(columns=['日期','股票代码','收益率'])
+stock = '000001'
+def stock_hq(stock_li,begt,endt):
+    df_hq = pd.DataFrame()
+    for stock in stock_li:
+        data_temp = ak.stock_zh_a_hist(stock, period="daily", start_date=begt, end_date=endt, adjust="")
+        df_hq = pd.concat([df_hq,data_temp],ignore_index=True)
+    return(df_hq)
+import networkx as nx
+
+for i in stock_embed.shape[0]:
+    j = np.arg
+cor = stock_embed @ stock_embed.T
+liag = [1/np.sqrt(stock_embed[i,:] @ stock_embed.T[:,i]) for i in range(stock_embed.shape[0])]
+liag_mat = np.diag(liag)
+cor_n = liag_mat @ cor @ liag_mat 
+np.fill_diagonal(cor_n, -1000)
+temp = np.argmax(cor_n,1)
+edges = [(i,temp[i]) for i in range(len(temp))]
+edges_stk = [(stocks.loc[element[0],'name'],stocks.loc[element[1],'name']) for element in edges]
+G_stock = nx.Graph()
+G_stock.add_nodes_from(stocks)
+G_stock.add_edges_from(edges_stk)
+stk_li = stocks['code'].astype(str).str.zfill(6).to_list()
+stock_li = stk_li
+df_hq = stock_hq(stk_li,'20241202','20241203')
+begt = '20241202'
+endt = '20241203'
+ak.stock_zh_a_hist('000001', period="daily", start_date='20241202', end_date='20241203', adjust="")
+    
+stk_embed_sli = stock_embed[:,0:110]
+next_d = stock_embed[:,110]
+next_d_id = list(enumerate(next_d)) 
+next_d_s = sorted(next_d_id,key=lambda x:x[1],reverse=True)
+df_next_d = pd.DataFrame(next_d_s,columns=['code_idx','value'])
+df_next_d[df_next_d['value']<=21]
+'''
+next_d_df = pd.DataFrame(next_d_id)
+next_d_df[next_d_df[0]==4128]
+next_d.max()
+'''
+next_d_s_np = np.array(next_d_s)
+next_d_t10 = next_d_s_np[0:10,0]
+cor_t10 = np.zeros((cor_n.shape[0])) 
+for i in range(len(next_d_t10)):
+    cor_t10 += cor_n[:,int(next_d_t10[i])]
+
+def min_id(x):
+    x_id = list(enumerate(x))
+    result = sorted(x_id,key=lambda x:x[1],reverse=True)
+    return result
+re = min_id(cor_t10)
+re_np = np.array(re)
+next_d_s_np[10:]
+re_np[0:-10,:]
+result = np.hstack((next_d_s_np[10:],re_np[0:-10,:]))
+cor_t10    
+
+
+
+
+from itertools import product
+path = '/Users/qinpeng/Desktop/python项目/天软/classifaction.csv'
+df_sum = pd.read_csv(path)
+date_ser = df_sum['日期'].unique()
+code_ser = df_sum['股票代码'].unique()
+# 生成所有股票和日期的组合
+combinations = list(product(date_ser, code_ser))
+# 将组合转换为 DataFrame，并且与之前的表联结在一起
+result_df = pd.DataFrame(combinations, columns=['日期', '股票代码'])
+merged_df = pd.merge(result_df, df_sum, on=['日期', '股票代码'], how='left').sort_values(by=['股票代码','日期'],ascending=[True,True]).reset_index()
+code_li = merged_df.columns[2:].to_list()
+for i in merged_df.index:
+    if pd.isna(merged_df.loc[i,'累计涨跌幅']):
+       if i>0:
+          if merged_df.loc[i,'股票代码'] == merged_df.loc[i-1,'股票代码']:
+              merged_df.loc[i,code_li[2:]]  = merged_df.loc[i-1,code_li[2:]]
+              
+          else:
+              merged_df.loc[i,code_li[2:]]  = merged_df.loc[i+1,code_li[2:]]
+              
+       else:
+            merged_df.loc[i,code_li[2:]]  = merged_df.loc[i+1,code_li[2:]]
+length = len(merged_df) - 1
+for i in merged_df.index:
+    if pd.isna(merged_df.loc[length-i,'累计涨跌幅']):
+       if length-i<length:
+          if merged_df.loc[length-i,'股票代码'] == merged_df.loc[length-i+1,'股票代码']:
+              merged_df.loc[length-i,code_li[2:]]  = merged_df.loc[length-i+1,code_li[2:]]
+              
+          else:
+              merged_df.loc[length-i,code_li[2:]]  = merged_df.loc[length-i-1,code_li[2:]]
+              
+       else:
+            merged_df.loc[length-i,code_li[2:]]  = merged_df.loc[length-i-1,code_li[2:]]
+
+
+connected_stocks = list(nx.connected_components(G_stock))
+classified_stocks = [list(component) for component in connected_stocks]
+
+f_n = 603395
+stocks[stocks['code']==f_n]
+f_n = '红四方'
+for i in classified_stocks:
+    if f_n in i: 
+      f_l = i
+result[:10,:]
+stocks.loc[4895,:] #联云科技
+# 联芸科技
+merged_df[merged_df['股票代码']==688449]
+f_n = 688449
+stocks[stocks['code']==f_n]
+f_n = '红四方'
+for i in classified_stocks:
+    if f_n in i: 
+      f_l = i
+result[0:10,:]
+# 4128 469
+stocks.loc[4128,:]#红四方
+stocks.loc[469,:]#美能能源
+#1299
+stocks[stocks['code']==f_n]
+f_n = '美能能源'
+for i in classified_stocks:
+    if f_n in i: 
+      f_l = i
+
+merged_df[merged_df['股票代码']==1299]
+
+next_d_s_np[:10,:]
+stocks.loc[460,:]#强邦新材
+#1279
+stocks[stocks['code']==f_n]
+f_n = '强邦新材'
+for i in classified_stocks:
+    if f_n in i: 
+      f_l = i
+merged_df[merged_df['股票代码']==1279]
+# 2432
+stocks.loc[2432,:]
+a = merged_df[merged_df['股票代码']==301008]
+a = df_sum[df_sum['股票代码']==301008]
+
+# 重新写代码，对涨幅排名靠前的进行预测
+stock_embed_ds = stock_embed[:,0:110]
+stock_110 = stock_embed[:,110]
+cor_110 = stock_embed_ds @ stock_embed_ds.T
+diag_110 = [1/np.sqrt(stock_embed_ds[i,:] @ stock_embed_ds[i,:].T)for i in range(stock_embed_ds.shape[0])]
+cor_110 = np.diag(diag_110) @ cor_110 @ np.diag(diag_110)
+np.fill_diagonal(cor_110, -1000)
+def min_id(x):
+    x_id = list(enumerate(x))
+    result = sorted(x_id,key=lambda x:x[1],reverse=True)
+    return result
+stock_110_idx = pd.DataFrame(min_id(stock_110),columns=['idx','value'])
+stock_110_idx_cl = stock_110_idx[stock_110_idx['value']<22].reset_index()
+stocks_high = stock_110_idx_cl.loc[0:40,'idx'].to_list()
+
+result_110 = np.zeros((cor_110.shape[0]))
+# element = 1
+# result_110.shape
+for element in stocks_high:
+    result_110 += cor_110[:,element]
+    
+result_110_sort = pd.DataFrame(min_id(result_110),columns=['idx','value'])
+sequence = np.arange(len(result_110_sort))
+result_110_sort['Seq'] = sequence
+stock_110_idx['Seq'] = sequence
+result = pd.merge(result_110_sort,stock_110_idx,on='idx')
+stock_embed[5069,111:120]
+stock_embed[1853,111:120]
+stocks.loc[5069,:]
+stocks.loc[1853,:]
+num = 17
+num_idx = result.loc[num,'idx']
+focus_code = stocks.loc[result.loc[num,'idx'],'code']
+focus_stock = stocks.loc[result.loc[num,'idx'],'name']
+connected_stocks = list(nx.connected_components(G_stock))
+classified_stocks = [list(component) for component in connected_stocks]
+for element in classified_stocks:
+    if focus_stock in element:
+        focus_li = element
+len(focus_li)
+focus_df = pd.DataFrame(columns=['o_idx','o_code','o_stk','idx','code','stkname','relation'])   
+for i,element in enumerate(stocks_high):
+    focus_df.loc[i,'o_idx'] = num_idx
+    focus_df.loc[i,'o_code'] = focus_code
+    focus_df.loc[i,'o_stk'] = focus_stock
+    focus_df.loc[i,'idx'] = element
+    focus_df.loc[i,'code'] = stocks.loc[element,'code']
+    focus_df.loc[i,'stkname'] = stocks.loc[element,'name']
+    focus_df.loc[i,'relation'] = cor_110[num_idx,element]
+focus_df 
+# num = 0
+num_idx = result.loc[num,'idx']
+print(stock_embed[num_idx,111:120])
+stock_embed[2137,111:120]
+stock_300978 = df_sum[df_sum['股票代码']==300978].reset_index()
+
+
+
+stock_300978.loc[110,:]
+
+a = result.loc[0:40,'idx'].to_list()
+np.mean(stock_embed[a,111:120],axis=0)
+np.mean(stock_embed[stocks_high,111:120],axis=0)
+
+# stock_embed[[2,3],111:120]
+import os
+import site
+os.system('mkdir -p ' + site.getusersitepackages())
+os.system('ln -sf "/Applications/Wind API.app/Contents/python/WindPy.py"' + ' ' + site.getusersitepackages())
+os.system('ln -sf "/Applications/Wind API.app/Contents/python/WindPy.py"' + ' ' + site.getsitepackages()[0])
+os.system('rm -rf ~/.Wind')
+os.system('ln -sf ~/Library/Containers/com.wind.mac.api/Data/.Wind ~/.Wind')
+
+site.getusersitepackages()  
+
+from WindPy import *
+
+ret = w.start()
+print(ret)
+
+print(site.getusersitepackages())
+
+
+import sys
+
+# 增加自定义路径
+custom_path = '/Users/qinpeng/.local/lib/python3.10/site-packages'
+if custom_path not in sys.path:
+    sys.path.append(custom_path)
+    
+    
+from WindPy import *
+
+ret = w.start()
+print(ret)
+
+ret = w.isconnected()
+print(ret)
+
+#test WSD function
+ret = w.wsd("000001.SZ", "sec_name,CLOSE,HIGH,LOW,OPEN", "2022-05-08", "2022-06-08", "",usedf=True)
+print(ret)
+ret.Data[0]
+ret[1]
+a = ret.Times
+ret = w.wsd(["000001.SZ","601318.SH"], "CLOSE", "2022-05-08", "2022-06-08", "",usedf=True)
+print(ret)
+history_data=w.wsd("010107.SH",
+                   "sec_name,ytm_b,volume,duration,convexity,open,high,low,close,vwap", 
+                   "2018-06-01", "2018-06-11", "returnType=1;PriceAdj=CP", usedf=True) 
+# returnType表示到期收益率计算方法，PriceAdj表示债券价格类型‘
+history_data[1].head()
+
+
+
+codes="IF00.CFE";
+fields="open,high,low,close";
+error,data=w.wsi(codes, fields, "2017-06-01 09:30:00", datetime.today(), "",usedf=True)
